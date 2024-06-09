@@ -1,0 +1,8 @@
+physical keys used for key:
+	a w s e d f t g y h u j k
+
+octave:
+	up/down
+
+toggle audio output:
+	space
