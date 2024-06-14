@@ -76,13 +76,7 @@ freqOf :: proc(note: f32) -> f32 {
 	return BASE_FREQ * math.pow_f32(2.0, (note / 12.0))
 }
 addVoice :: proc(waveforms: [dynamic]VoiceWaveform, freqOffset: f32) {
-	// HARD copy waveforms to allow polyphony later on
-	waveformsCopy := make([dynamic]VoiceWaveform)
-	for i in 0..<len(waveforms) {
-		append(&waveformsCopy, waveforms[i])
-	}
-
-	append(&voices, VoiceData{waveformsCopy, freqOffset, false})
+	append(&voices, VoiceData{waveforms, freqOffset, false})
 }
 
 fillBuffer :: proc(_: ^thread.Thread) {

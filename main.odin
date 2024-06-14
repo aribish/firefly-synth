@@ -2,9 +2,10 @@ package main
 
 import "core:fmt"
 import sdl "vendor:sdl2"
-import ttf "vendor:sdl2/ttf"
+import "vendor:sdl2/ttf"
 import "core:c"
 import "core:thread"
+import "core:math"
 
 WIN_WIDTH :: 800
 WIN_HEIGHT :: 600
@@ -17,10 +18,8 @@ FONT_SIZE_MULT :: 1
 OCTAVE_MIN :: 1
 OCTAVE_MAX :: 7
 
-Text :: struct {
-	texture: ^sdl.Texture,
-	strLen: int
-}
+MAX_VOICES :: 6
+MAX_WAVEFORMS :: 4
 
 KeyboardKeyData :: struct {
 	down: bool,
@@ -33,6 +32,9 @@ render: ^sdl.Renderer
 event: sdl.Event
 nextTick: u32
 inputThread: ^thread.Thread
+
+drawingWaveform := true
+drawingKeyboard := true
 
 font: ^ttf.Font
 titleText: Text
@@ -53,142 +55,15 @@ keyboardKeys: [13]sdl.Keycode = {
 	.j,
 	.k
 }
-keyboardKeyData: [13]KeyboardKeyData
 
-whiteKeys: [8]i32 = { // for ui
-	0,
-	2,
-	4,
-	5,
-	7,
-	9,
-	11,
-	12
-}
-blackKeys: [5]i32 = { // for ui
-	1,
-	3,
-	6,
-	8,
-	10
-}
+keyboardKeyData: [13]KeyboardKeyData
 
 octave: i32 = 4
 keyboardKeysDown: []i32 // pressed key for each voice
 
-// returns index of keyboard key on true, -1 on false
-isKeyboardKeyEvent :: proc(keycode: sdl.Keycode) -> i32 {
-	for i: i32 = 0; i < 13; i += 1 {
-		if keycode == keyboardKeys[i] {
-			return i
-		}
-	}
-
-	return -1
-}
-
-handleInput :: proc(_: ^thread.Thread) {
-	for running {
-		for sdl.WaitEvent(&event) {
-			if event.type == sdl.EventType.QUIT {
-				running = false
-				return
-			}
-			else if event.type == sdl.EventType.KEYUP {
-				if event.key.keysym.sym == sdl.Keycode.SPACE {
-					sdl.PauseAudioDevice(audioDevice, !paused)
-					paused = !paused
-				}
-				else if event.key.keysym.sym == sdl.Keycode.UP {
-					if octave < OCTAVE_MAX {
-						octave += 1
-					}
-				}
-				else if event.key.keysym.sym == sdl.Keycode.DOWN {
-					if octave > OCTAVE_MIN {
-						octave -= 1
-					}
-				}
-				else {
-					key := isKeyboardKeyEvent(event.key.keysym.sym)
-
-					if key != -1 {
-						keyboardKeyData[key].down = false
-
-						if keyboardKeyData[key].voice != -1 {
-							// if a note was pressed but not being played due to the voice cap, play it!
-							// else, stop playing this voice
-							for i in 0..<len(keyboardKeyData) {
-								if keyboardKeyData[i].down && keyboardKeyData[i].voice == -1 {
-									keyboardKeyData[i].voice = keyboardKeyData[key].voice
-									adjustVoiceFreqs(keyboardKeyData[key].voice, freqOf(f32(octave * 12 + i32(i))))
-									break
-								}
-								else if i == len(keyboardKeyData) - 1 {
-									voices[keyboardKeyData[key].voice].playing = false
-								}
-							}
-
-							keyboardKeyData[key].voice = -1
-						}
-					}
-				}
-			}
-			else if event.type == sdl.EventType.KEYDOWN {
-				key := isKeyboardKeyEvent(event.key.keysym.sym)
-
-				if key != -1 && !keyboardKeyData[key].down {
-					keyboardKeyData[key].down = true
-
-					// get the next voice to play
-					for i in 0..<len(voices) {
-						if !voices[i].playing || i == len(voices) - 1 {
-							// unassign voice from previous note (it is still pressed!!!)
-							if i == len(voices) - 1 {
-								for j in 0..<len(keyboardKeyData) {
-									if keyboardKeyData[j].voice == i {
-										keyboardKeyData[j].voice = -1
-										break
-									}
-								}
-							}
-
-							keyboardKeyData[key].voice = i
-							voices[i].playing = true
-							adjustVoiceFreqs(i, freqOf(f32(octave * 12 + key)))
-
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-generateText :: proc(text: cstring, fg, bg: sdl.Color) -> Text {
-	texture: ^sdl.Texture = nil
-
-	surface: ^sdl.Surface = ttf.RenderText_Shaded(font, text, fg, bg)
-	if surface != nil {
-		texture = sdl.CreateTextureFromSurface(render, surface)
-		sdl.FreeSurface(surface)
-	}
-
-	return Text {
-		texture,
-		len(text)
-	}
-}
-
-// NOTE All text is expected to be 
-drawText :: proc(text: Text, x, y: i32) {
-	rect := sdl.Rect {
-		x, y,
-		i32(text.strLen) * FONT_WIDTH, FONT_HEIGHT * FONT_SIZE_MULT
-	}
-	sdl.RenderCopy(render, text.texture, nil, &rect)
-}
+// updating ui directly in the input thread is not working
+// so it gets acknowledged and then handled in the main loop
+uiUpdateReady: bool = true
 
 main :: proc() {
 	sdl.Init(sdl.INIT_VIDEO | sdl.INIT_AUDIO)
@@ -211,35 +86,23 @@ main :: proc() {
 		keyboardKeyData[i].voice = -1
 	}
 
-	// init text
-	ttf.Init()
-	defer ttf.Quit()
-
-	font = ttf.OpenFont("PeaberryMono.ttf", FONT_HEIGHT * FONT_SIZE_MULT)
-	defer ttf.CloseFont(font)
+	initGui()
+	defer quitGui()
 	
-	titleText = generateText("Odin Synthesizer", sdl.Color{0, 0, 0, 0xff}, sdl.Color{0xff, 0xff, 0, 0xff})
-	defer sdl.DestroyTexture(titleText.texture)
-
-	voicesHeaderText = generateText("Output Waveform", sdl.Color{0, 0, 0, 0xff}, sdl.Color{0xff, 0xff, 0, 0xff})
-	defer sdl.DestroyTexture(voicesHeaderText.texture)
-
+	titleText = newText("Odin Synthesizer", COLOR_BLACK, COLOR_YELLOW)
+	defer destroyText(titleText)
 
 	// init audio
 	initSynth()
 	defer quitSynth()
 	sdl.PauseAudioDevice(audioDevice, false)
 
-	// temp
+	// default voice (synth handles deleting waveforms too!)
 	waveforms: [dynamic]VoiceWaveform
-	defer delete(waveforms)
-	append(&waveforms, VoiceWaveform{Waveform.Triangle, freqOf(48), 0.5, 0.0})
-	append(&waveforms, VoiceWaveform{Waveform.Sawtooth, freqOf(24), 0.75, 0.0})
-	append(&waveforms, VoiceWaveform{Waveform.Sine, freqOf(12), 1.0, 0.0})
+	append(&waveforms, VoiceWaveform{Waveform.Sawtooth, 440, 1, 0.0})
 	addVoice(waveforms, 0)
-	addVoice(waveforms, 0)
-	addVoice(waveforms, 0)
-	addVoice(waveforms, 0)
+	addVoiceUI()
+	addWaveformUI(0)
 
 	for running {
 		tick := sdl.GetTicks()
@@ -250,84 +113,263 @@ main :: proc() {
 			continue
 		}
 
+		updateUi()
+
 		sdl.SetRenderDrawColor(render, 0, 0, 0, 0xff)
 		sdl.RenderClear(render)
 
 		drawText(titleText, (WIN_WIDTH - (i32(titleText.strLen) * (FONT_WIDTH * FONT_SIZE_MULT))) / 2, FONT_HEIGHT * FONT_SIZE_MULT)
 
-		// draw waveforms
-		drawText(voicesHeaderText, 0, WIN_HEIGHT - 100 - FONT_HEIGHT * FONT_SIZE_MULT)
-		sdl.SetRenderDrawColor(render, 0xff, 0xff, 0, 0xff)
-		sdl.RenderFillRect(render, &sdl.Rect{0, WIN_HEIGHT - 100, WIN_WIDTH, 100})
+		drawVoiceUi()
 
-		sdl.SetRenderDrawColor(render, 0xff, 0, 0, 0xff)
-		lastY: i32 = WIN_HEIGHT - 50 - i32(50.0 * buffer[0])
-		inc: int = SAMPLES_PER_BUFFER / WIN_WIDTH
-		for i := inc; i < WIN_WIDTH; i += inc {
-			y: i32 = WIN_HEIGHT - 50 - i32(50.0 * buffer[i])
-			sdl.RenderDrawLine(render, i32(i - 1), lastY, i32(i), y)
-			lastY = y
+		if drawingWaveform {
+			drawWaveform()
 		}
 
-
-		// draw keyboard keys
-		sdl.SetRenderDrawColor(render, 0xff, 0xff, 0, 0xff)
-		sdl.RenderFillRect(render, &sdl.Rect{(WIN_WIDTH - 320) / 2, WIN_HEIGHT - 200 - FONT_HEIGHT * FONT_SIZE_MULT, 
-			320, 100})
-
-		for i in 0..<8 {
-			rect := sdl.Rect {
-				(WIN_WIDTH - 320) / 2 + i32(i) * 40,
-				WIN_HEIGHT - 200 - FONT_HEIGHT * FONT_SIZE_MULT,
-				40,
-				100
-			}
-
-			sdl.SetRenderDrawColor(render, 0, 0, 0, 0xff)
-			sdl.RenderDrawRect(render, &rect)
-			if keyboardKeyData[whiteKeys[i]].voice != -1 {
-				rect.x += 1
-				rect.y += 1
-				rect.w -= 2
-				rect.h -= 2
-
-				sdl.SetRenderDrawColor(render, 0xff, 0, 0, 0xff)
-				sdl.RenderFillRect(render, &rect)
-			}
-		}
-
-		for i in 0..<5 {
-			
-
-			rect := sdl.Rect {
-				20 + (WIN_WIDTH - 320) / 2 + i32(i) * 40,
-				WIN_HEIGHT - 200 - FONT_HEIGHT * FONT_SIZE_MULT,
-				40,
-				50
-			}
-
-			if i >= 2 {
-				rect.x += 40
-			}
-
-			sdl.SetRenderDrawColor(render, 0, 0, 0, 0xff)
-			sdl.RenderDrawRect(render, &rect)
-
-			rect.x += 1
-			rect.y += 1
-			rect.w -= 2
-			rect.h -= 2
-
-			if keyboardKeyData[blackKeys[i]].voice == -1 {
-				sdl.SetRenderDrawColor(render, 0xff, 0xff, 0, 0xff)
-			}
-			else {
-				sdl.SetRenderDrawColor(render, 0xff, 0, 0, 0xff)
-			}
-			sdl.RenderFillRect(render, &rect)
+		if drawingKeyboard {
+			drawKeyboard()
 		}
 
 		sdl.RenderPresent(render)
 		sdl.PumpEvents()
+	}
+}
+
+updateUi :: proc() {
+	if uiUpdateReady {
+		for i in 0..<len(voices) {
+			// add voice event?
+			if len(voiceUI) < len(voices) {
+				addVoiceUI()
+			}
+
+			for j in 0..<len(voices[i].waveforms) {
+				// new waveform?
+				if j >= len(voiceUI[i].waveforms) {
+					addWaveformUI(i)
+				}
+
+				// waveform type change?
+				if voiceUI[i].waveforms[j].wfType != voices[i].waveforms[j].type {
+					voiceUI[i].waveforms[j].wfType = voices[i].waveforms[j].type
+
+					switch voiceUI[i].waveforms[j].wfType {
+						case .Sine:
+							destroyText(voiceUI[i].waveforms[j].outputWfLabel)
+							voiceUI[i].waveforms[j].outputWfLabel = newText("sin", COLOR_RED, COLOR_BLACK)
+							return
+						case .Sawtooth:
+							destroyText(voiceUI[i].waveforms[j].outputWfLabel)
+							voiceUI[i].waveforms[j].outputWfLabel = newText("saw", COLOR_RED, COLOR_BLACK)
+							return
+						case .Triangle:
+							destroyText(voiceUI[i].waveforms[j].outputWfLabel)
+							voiceUI[i].waveforms[j].outputWfLabel = newText("tri", COLOR_RED, COLOR_BLACK)
+							return
+						case .Square:
+							destroyText(voiceUI[i].waveforms[j].outputWfLabel)
+							voiceUI[i].waveforms[j].outputWfLabel = newText("sqr", COLOR_RED, COLOR_BLACK)
+							return
+					}
+				} // amp change?
+				else if voiceUI[i].waveforms[j].amp != voices[i].waveforms[j].amp {
+					voiceUI[i].waveforms[j].amp = voices[i].waveforms[j].amp
+
+					destroyText(voiceUI[i].waveforms[j].outputAmpLabel)
+					voiceUI[i].waveforms[j].outputAmpLabel = newText((voiceUI[i].waveforms[j].amp < 0.05) ? "0.0" : fmt.caprintf("%.1f", voiceUI[i].waveforms[j].amp), COLOR_RED, COLOR_BLACK)
+				} // freq proportion change?
+				else if voiceUI[i].waveforms[j].freqProportionChanged {
+					voiceUI[i].waveforms[j].freqProportionChanged = false
+					destroyText(voiceUI[i].waveforms[j].outputFreqLabel)
+					voiceUI[i].waveforms[j].outputFreqLabel = newText(fmt.caprintf("%.2f", voiceUI[i].waveforms[j].freqProportion), COLOR_RED, COLOR_BLACK)
+				}
+			}
+		}
+
+		uiUpdateReady = false
+	}
+}
+
+// INPUT HANDLERS //
+
+// returns index of keyboard key on true, -1 on false
+isKeyboardKeyEvent :: proc(keycode: sdl.Keycode) -> i32 {
+	for i: i32 = 0; i < 13; i += 1 {
+		if keycode == keyboardKeys[i] {
+			return i
+		}
+	}
+
+	return -1
+}
+
+keyboardKeyUpEvent :: proc(key: i32) {
+	keyboardKeyData[key].down = false
+	if keyboardKeyData[key].voice != -1 {
+		// if a note was pressed but not being played due to the voice cap, play it!
+		// else, stop playing this voice
+		for i := len(keyboardKeyData) - 1; i >= 0; i -= 1 {
+			if keyboardKeyData[i].down && keyboardKeyData[i].voice == -1 {
+				keyboardKeyData[i].voice = keyboardKeyData[key].voice
+				adjustVoiceFreqs(keyboardKeyData[key].voice, freqOf(f32(octave * 12 + i32(i))))
+				break
+			}
+			else if i == 0 {
+				voices[keyboardKeyData[key].voice].playing = false
+			}
+		}
+
+		keyboardKeyData[key].voice = -1
+	}
+}
+
+keyboardKeyDownEvent :: proc(key: i32) {
+	if !keyboardKeyData[key].down {
+		keyboardKeyData[key].down = true
+
+		// get the next voice to play
+		for i in 0..<len(voices) {
+			if !voices[i].playing || i == len(voices) - 1 {
+				// unassign voice from previous note (it is still pressed!!!)
+				if i == len(voices) - 1 {
+					for j in 0..<len(keyboardKeyData) {
+						if keyboardKeyData[j].voice == i {
+							keyboardKeyData[j].voice = -1
+							break
+						}
+					}
+				}
+
+				keyboardKeyData[key].voice = i
+				voices[i].playing = true
+				adjustVoiceFreqs(i, freqOf(f32(octave * 12 + key)))
+
+				break
+			}
+		}
+	}
+}
+
+addVoiceEvent :: proc() {
+	if len(voices) < MAX_VOICES {
+		waveforms := make([dynamic]VoiceWaveform)
+		append(&waveforms, VoiceWaveform{Waveform.Sine, freqOf(12), 1.0, 0.0})
+		addVoice(waveforms, 0)
+		uiUpdateReady = true
+	}
+}
+
+checkWaveformChangeEvent :: proc() -> bool {
+	for i in 0..<len(voiceUI) {
+		// add waveform
+		if isMouseInsideButton(voiceUI[i].addWaveformButton) && len(voices[i].waveforms) < MAX_WAVEFORMS {
+			append(&voices[i].waveforms, VoiceWaveform{Waveform.Sine, voices[i].waveforms[0].freq, 1.0, 0.0})
+			uiUpdateReady = true
+			return true
+		}
+
+		for j in 0..<len(voiceUI[i].waveforms) {
+			// i must have been tweakin
+			wf := voiceUI[i].waveforms[j]
+
+			// wf change
+			if isMouseInsideButton(wf.wfLeftButton) && voices[i].waveforms[j].type != Waveform.Sine {
+				voices[i].waveforms[j].type -= Waveform(1)
+				uiUpdateReady = true
+				return true
+			}
+			else if isMouseInsideButton(wf.wfRightButton) && voices[i].waveforms[j].type != Waveform.Square {
+				voices[i].waveforms[j].type += Waveform(1)
+				uiUpdateReady = true
+				return true
+			} // amp change
+			else if isMouseInsideButton(wf.ampLeftButton) && voices[i].waveforms[j].amp > 0.0 {
+				voices[i].waveforms[j].amp -= 0.1
+				uiUpdateReady = true
+				return true
+			}
+			else if isMouseInsideButton(wf.ampRightButton) && voices[i].waveforms[j].amp < 1.0 {
+				voices[i].waveforms[j].amp += 0.1
+				uiUpdateReady = true
+				return true
+			} // freq proportion change
+			else if isMouseInsideButton(wf.freqLeftButton) && wf.freqProportion > -9.0 && j != 0 {
+				voiceUI[i].waveforms[j].freqProportionChanged = true
+				voiceUI[i].waveforms[j].freqProportion -= 1.0 / 12.0
+				uiUpdateReady = true
+
+				adjustedNoteIndex: f32 = math.log2_f32(voices[i].waveforms[0].freq / BASE_FREQ) + voiceUI[i].waveforms[j].freqProportion
+				voices[i].waveforms[j].freq = freqOf(adjustedNoteIndex * 12.0)
+			}
+			else if isMouseInsideButton(wf.freqRightButton) && wf.freqProportion < 9.0 && j != 0 {
+				voiceUI[i].waveforms[j].freqProportionChanged = true
+				voiceUI[i].waveforms[j].freqProportion += 1.0 / 12.0
+
+				adjustedNoteIndex: f32 = math.log2_f32(voices[i].waveforms[0].freq / BASE_FREQ) + voiceUI[i].waveforms[j].freqProportion
+				voices[i].waveforms[j].freq = freqOf(adjustedNoteIndex * 12.0)
+				uiUpdateReady = true
+			}
+		}
+
+	}
+
+	return false
+}
+
+// hub input function, runs in its own thread
+handleInput :: proc(_: ^thread.Thread) {
+	for running {
+		for sdl.WaitEvent(&event) {
+			if event.type == sdl.EventType.QUIT {
+				running = false
+				return
+			}
+			else if event.type == sdl.EventType.KEYUP {
+				// toggle audio device
+				if event.key.keysym.sym == sdl.Keycode.p {
+					sdl.PauseAudioDevice(audioDevice, !paused)
+					paused = !paused
+				} // toggle onscreen keyboard
+				else if event.key.keysym.sym == sdl.Keycode.SPACE {
+					drawingKeyboard = !drawingKeyboard
+				} // toggle waveform output ui
+				else if event.key.keysym.sym == sdl.Keycode.RETURN {
+					drawingWaveform = !drawingWaveform
+				} // octave changes
+				else if event.key.keysym.sym == sdl.Keycode.UP {
+					if octave < OCTAVE_MAX {
+						octave += 1
+					}
+}
+				else if event.key.keysym.sym == sdl.Keycode.DOWN {
+					if octave > OCTAVE_MIN {
+						octave -= 1
+					}
+				}
+				else { // keyboard key release
+					key := isKeyboardKeyEvent(event.key.keysym.sym)
+
+					if key != -1 {
+						keyboardKeyUpEvent(key)	
+					}
+				}
+			} // keyboard key press
+			else if event.type == sdl.EventType.KEYDOWN {
+				key := isKeyboardKeyEvent(event.key.keysym.sym)
+
+				if key != -1 {
+					keyboardKeyDownEvent(key)
+				}
+			}
+			else if event.type == sdl.EventType.MOUSEBUTTONUP {
+				// add voice
+				if isMouseInsideButton(addVoiceButton) {
+					addVoiceEvent()
+				}
+				else {
+					checkWaveformChangeEvent()
+				}
+			}
+		}
 	}
 }

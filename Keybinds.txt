@@ -5,4 +5,10 @@ octave:
 	up/down
 
 toggle audio output:
+	p
+
+toggle onscreen keyboard:
 	space
+
+toggle output waveform ui:
+	enter/return
