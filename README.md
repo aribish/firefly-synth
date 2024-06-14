@@ -13,7 +13,7 @@ restrictions of making this look all retro has been pretty hard.
 Here's how the waveform UI is setup:
 * `WF <>` - click the arrows to choose between 4 basic waveforms
 * `A <>` - changes the amplitude of the waveform
-* `F <>` - increases/decreases the semitone offset from the root waveform. It is displayed as the offset divided by 12 right, I'll change that later
+* `F <>` - increases/decreases the semitone offset from the root waveform. It is displayed as the offset divided by 12 right now, I'll change that later
 
 ## 2024-06-09
 Here is a demo of what I've done so far! Below is a list of features:
